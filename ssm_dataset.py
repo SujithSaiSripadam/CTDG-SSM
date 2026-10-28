@@ -56,6 +56,12 @@ class TemporalEdgeDataset(torch.utils.data.Dataset):
         self.task = task
         self.unique_batch = unique_batch
         self.negative = negative
+        # speedup #2 (INFERENCE_SPEEDUP_PLAN.md §5): per-window CPU allocations
+        # cached once. t_nodes cache = arange(2T) (windows are ≤ T edges, so
+        # 2*len(src_t) ≤ 2T; lazy re-extend if ever exceeded). Values identical
+        # per window (slice of arange == arange).
+        self._t_nodes_cache = None
+        self._inductive_mask_gpu = None
         if self.biparted:
             self.rnd_dst = torch.zeros(self.num_node, dtype=torch.bool, device=device)
             self.rnd_dst[self.dst]=True
@@ -108,11 +114,15 @@ class TemporalEdgeDataset(torch.utils.data.Dataset):
         if self.n_mode=='eval' and self.task == 'LP':
             g = torch.Generator(device=self.device)
             g.manual_seed(idx+len(self.times))
-            data.inductive_mask = self.inductive_mask[t_start:t_end]
+            if self._inductive_mask_gpu is None:   # one-time H2D (was: torch.tensor(...) per window)
+                self._inductive_mask_gpu = torch.as_tensor(self.inductive_mask, device=self.device)
+            data.inductive_mask = self._inductive_mask_gpu[t_start:t_end]
         
 
         total = 2*len(src_t)
-        t_nodes_id = torch.arange(total).to(self.device)
+        if self._t_nodes_cache is None or self._t_nodes_cache.numel() < total:
+            self._t_nodes_cache = torch.arange(max(total, 2*self.T), device=self.device)
+        t_nodes_id = self._t_nodes_cache[:total]
         combined_nodes = torch.hstack([src_t,dst_t])
 
         if self.task == 'NC':
@@ -178,7 +188,7 @@ class TemporalEdgeDataset(torch.utils.data.Dataset):
                     if size_EI>0:
                         data.ind_neg_src,data.ind_neg_dst = ind_valid_edge
                         # add random edge
-                        data.ind_neg_src = torch.hstack([data.ind_neg_src,src_t[size_EH:]])
+                        data.ind_neg_src = torch.hstack([data.ind_neg_src,src_t[size_EI:]])
                         data.ind_neg_dst = torch.hstack([data.ind_neg_dst,rnd_neg_dst])
                     else:
                         data.ind_neg_src=src_t
@@ -186,7 +196,7 @@ class TemporalEdgeDataset(torch.utils.data.Dataset):
 
                 else:
                     # print('Used Inductive Edge')
-                    perm = torch.randperm(size_EH, device=self.device,generator=g)[:E]
+                    perm = torch.randperm(size_EI, device=self.device,generator=g)[:E]
                     data.ind_neg_src,data.ind_neg_dst = ind_valid_edge[:,perm]
 
                 data.ind_neg_t = get_delta_t(data.ind_neg_src,data.ind_neg_dst,time_t,self.neighbour,self.ntimes,self.offset,default=1e+11)

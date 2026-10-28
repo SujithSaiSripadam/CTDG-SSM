@@ -67,8 +67,8 @@ def link_prediction_train_single_sequence(model:MemoryModel,dataset:TemporalEdge
             loss = loss_fn(score, label) 
             valid_grad = True
             batch_loss += loss
-            all_preds.append(score.detach().cpu())
-            all_labels.append(label.detach().cpu()) 
+            all_preds.append(score.detach())      # GPU; ONE .cpu() at end
+            all_labels.append(label.detach())
 
         # ==========================================================================================================================
         # # Old Model ===================================================================================================================
@@ -120,8 +120,8 @@ def link_prediction_train_single_sequence(model:MemoryModel,dataset:TemporalEdge
             batch_loss = 0
 
   
-    y_pred = torch.cat(all_preds).numpy()
-    y_true = torch.cat(all_labels).numpy()
+    y_pred = torch.cat(all_preds).cpu().numpy()
+    y_true = torch.cat(all_labels).cpu().numpy()
     auc = roc_auc_score(y_true, y_pred)
     return total_loss, auc
 
@@ -174,8 +174,8 @@ def link_prediction_eval(model: MemoryModel, dataset: TemporalEdgeDataset,tq_mod
         ind_score = model.PredictionMap(concat_states_ind)
         ind_label = torch.zeros_like(ind_score)
 
-        # Inductive mask
-        i_mask = torch.tensor(data.inductive_mask).to(model.device)
+        # Inductive mask (pre-sliced GPU buffer in dataset — was torch.tensor(...).to(device) per window)
+        i_mask = data.inductive_mask
 
         # Transductive masks (~i_mask)
         for neg_type, neg_score, neg_label in zip(
@@ -183,8 +183,8 @@ def link_prediction_eval(model: MemoryModel, dataset: TemporalEdgeDataset,tq_mod
             [rnd_score, hst_score, ind_score],
             [rnd_label, hst_label, ind_label]
         ):
-            t_preds[neg_type].append(torch.cat([pos_score[~i_mask], neg_score[~i_mask]]).detach().cpu())
-            t_labels[neg_type].append(torch.cat([pos_label[~i_mask], neg_label[~i_mask]]).detach().cpu())
+            t_preds[neg_type].append(torch.cat([pos_score[~i_mask], neg_score[~i_mask]]).detach())
+            t_labels[neg_type].append(torch.cat([pos_label[~i_mask], neg_label[~i_mask]]).detach())
 
         # Inductive masks (i_mask)
         for neg_type, neg_score, neg_label in zip(
@@ -192,19 +192,19 @@ def link_prediction_eval(model: MemoryModel, dataset: TemporalEdgeDataset,tq_mod
             [rnd_score, hst_score, ind_score],
             [rnd_label, hst_label, ind_label]
         ):
-            i_preds[neg_type].append(torch.cat([pos_score[i_mask], neg_score[i_mask]]).detach().cpu())
-            i_labels[neg_type].append(torch.cat([pos_label[i_mask], neg_label[i_mask]]).detach().cpu())
+            i_preds[neg_type].append(torch.cat([pos_score[i_mask], neg_score[i_mask]]).detach())
+            i_labels[neg_type].append(torch.cat([pos_label[i_mask], neg_label[i_mask]]).detach())
 
         model.zoh_update(data)
 
     # Compute metrics per case
     results = {'transductive': {}, 'inductive': {}}
     for neg_type in ['rnd', 'hst', 'ind']:
-        # Concatenate all batches
-        t_pred = torch.cat(t_preds[neg_type]).numpy()
-        t_true = torch.cat(t_labels[neg_type]).numpy()
-        i_pred = torch.cat(i_preds[neg_type]).numpy()
-        i_true = torch.cat(i_labels[neg_type]).numpy()
+        # Concatenate all batches (single GPU→CPU transfer per pass)
+        t_pred = torch.cat(t_preds[neg_type]).cpu().numpy()
+        t_true = torch.cat(t_labels[neg_type]).cpu().numpy()
+        i_pred = torch.cat(i_preds[neg_type]).cpu().numpy()
+        i_true = torch.cat(i_labels[neg_type]).cpu().numpy()
 
         # Compute AUC and AP
         results['transductive'][neg_type] = {

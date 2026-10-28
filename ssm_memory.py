@@ -343,7 +343,7 @@ class MemoryModel(nn.Module):
 
     def zoh_update(self,data:active_data):
         L_t = data.L_agg
-        Is = torch.eye(len(L_t)).to(L_t.device)
+        Is = torch.eye(len(L_t), device=L_t.device)
         delta_L = data.delta_L_agg
         As_bar = Is - self.reg*delta_L + self.reg**2 * delta_L @ (L_t + delta_L/2)
         
@@ -483,7 +483,7 @@ class MemoryModel(nn.Module):
 
 def zoh_update_HIPPO(self,data:active_data):
         L_t = data.L_agg
-        Is = torch.eye(len(L_t)).to(L_t.device)
+        Is = torch.eye(len(L_t), device=L_t.device)
         delta_L = data.delta_L_agg
         As_bar = Is - self.reg*delta_L + self.reg**2 * delta_L @ (L_t + delta_L/2)
         

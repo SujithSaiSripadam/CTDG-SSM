@@ -64,7 +64,7 @@ class Data:
         self.num_unique_nodes = len(self.unique_node_ids)
 
 
-def get_link_prediction_data(dataset_name: str, val_ratio: float, test_ratio: float):
+def get_link_prediction_data(dataset_name: str, val_ratio: float, test_ratio: float, edge_pad: bool = True):
     """
     generate data for link prediction task (inductive & transductive settings)
     :param dataset_name: str, dataset name
@@ -75,8 +75,8 @@ def get_link_prediction_data(dataset_name: str, val_ratio: float, test_ratio: fl
     """
     # Load data and train val test split
     graph_df = pd.read_csv('./processed_data/{}/ml_{}.csv'.format(dataset_name, dataset_name))
-    edge_raw_features = np.load('./processed_data/{}/ml_{}.npy'.format(dataset_name, dataset_name))
-    node_raw_features = np.load('./processed_data/{}/ml_{}_node.npy'.format(dataset_name, dataset_name))
+    edge_raw_features = np.load('./processed_data/{}/ml_{}.npy'.format(dataset_name, dataset_name), mmap_mode='r')
+    node_raw_features = np.load('./processed_data/{}/ml_{}_node.npy'.format(dataset_name, dataset_name), mmap_mode='r')
 
     NODE_FEAT_DIM = EDGE_FEAT_DIM = 172
     assert NODE_FEAT_DIM >= node_raw_features.shape[1], f'Node feature dimension in dataset {dataset_name} is bigger than {NODE_FEAT_DIM}!'
@@ -85,11 +85,13 @@ def get_link_prediction_data(dataset_name: str, val_ratio: float, test_ratio: fl
     if node_raw_features.shape[1] < NODE_FEAT_DIM:
         node_zero_padding = np.zeros((node_raw_features.shape[0], NODE_FEAT_DIM - node_raw_features.shape[1]))
         node_raw_features = np.concatenate([node_raw_features, node_zero_padding], axis=1)
-    if edge_raw_features.shape[1] < EDGE_FEAT_DIM:
+    if edge_pad and edge_raw_features.shape[1] < EDGE_FEAT_DIM:
         edge_zero_padding = np.zeros((edge_raw_features.shape[0], EDGE_FEAT_DIM - edge_raw_features.shape[1]))
         edge_raw_features = np.concatenate([edge_raw_features, edge_zero_padding], axis=1)
 
-    assert NODE_FEAT_DIM == node_raw_features.shape[1] and EDGE_FEAT_DIM == edge_raw_features.shape[1], 'Unaligned feature dimensions after feature padding!'
+    assert NODE_FEAT_DIM == node_raw_features.shape[1], 'Unaligned node feature dimensions after feature padding!'
+    if edge_pad:
+        assert EDGE_FEAT_DIM == edge_raw_features.shape[1], 'Unaligned feature dimensions after feature padding!'
 
     # get the timestamp of validate and test set
     val_time, test_time = list(np.quantile(graph_df.ts, [(1 - val_ratio - test_ratio), (1 - test_ratio)]))
@@ -112,11 +114,15 @@ def get_link_prediction_data(dataset_name: str, val_ratio: float, test_ratio: fl
     # compute nodes which appear at test time
     test_node_set = set(src_node_ids[node_interact_times > val_time]).union(set(dst_node_ids[node_interact_times > val_time]))
     # sample nodes which we keep as new nodes (to test inductiveness), so then we have to remove all their edges from training
-    new_test_node_set = set(random.sample(test_node_set, int(0.1 * num_total_unique_node_ids)))
+    new_test_node_set = set(random.sample(sorted(test_node_set), int(0.1 * num_total_unique_node_ids)))
 
     # mask for each source and destination to denote whether they are new test nodes
-    new_test_source_mask = graph_df.u.map(lambda x: x in new_test_node_set).values
-    new_test_destination_mask = graph_df.i.map(lambda x: x in new_test_node_set).values
+    # (lookup-table membership check: O(N) memory, avoids a Python-level .map over every row)
+    node_lookup_size = int(max(src_node_ids.max(), dst_node_ids.max())) + 1
+    new_test_node_lookup = np.zeros(node_lookup_size, dtype=bool)
+    new_test_node_lookup[np.fromiter(new_test_node_set, dtype=np.longlong, count=len(new_test_node_set))] = True
+    new_test_source_mask = new_test_node_lookup[src_node_ids]
+    new_test_destination_mask = new_test_node_lookup[dst_node_ids]
 
     # mask, which is true for edges with both destination and source not being new test nodes (because we want to remove all edges involving any new test node)
     observed_edges_mask = np.logical_and(~new_test_source_mask, ~new_test_destination_mask)
@@ -138,8 +144,10 @@ def get_link_prediction_data(dataset_name: str, val_ratio: float, test_ratio: fl
     test_mask = node_interact_times > test_time
 
     # new edges with new nodes in the val and test set (for inductive evaluation)
-    edge_contains_new_node_mask = np.array([(src_node_id in new_node_set or dst_node_id in new_node_set)
-                                            for src_node_id, dst_node_id in zip(src_node_ids, dst_node_ids)])
+    # same lookup-table trick, applied to the set of nodes absent from training
+    new_node_lookup = np.zeros(node_lookup_size, dtype=bool)
+    new_node_lookup[np.fromiter(new_node_set, dtype=np.longlong, count=len(new_node_set))] = True
+    edge_contains_new_node_mask = new_node_lookup[src_node_ids] | new_node_lookup[dst_node_ids]
     new_node_val_mask = np.logical_and(val_mask, edge_contains_new_node_mask)
     new_node_test_mask = np.logical_and(test_mask, edge_contains_new_node_mask)
 
@@ -186,8 +194,8 @@ def get_node_classification_data(dataset_name: str, val_ratio: float, test_ratio
     """
     # Load data and train val test split
     graph_df = pd.read_csv('./processed_data/{}/ml_{}.csv'.format(dataset_name, dataset_name))
-    edge_raw_features = np.load('./processed_data/{}/ml_{}.npy'.format(dataset_name, dataset_name))
-    node_raw_features = np.load('./processed_data/{}/ml_{}_node.npy'.format(dataset_name, dataset_name))
+    edge_raw_features = np.load('./processed_data/{}/ml_{}.npy'.format(dataset_name, dataset_name), mmap_mode='r')
+    node_raw_features = np.load('./processed_data/{}/ml_{}_node.npy'.format(dataset_name, dataset_name), mmap_mode='r')
 
     NODE_FEAT_DIM = EDGE_FEAT_DIM = 172
     assert NODE_FEAT_DIM >= node_raw_features.shape[1], f'Node feature dimension in dataset {dataset_name} is bigger than {NODE_FEAT_DIM}!'

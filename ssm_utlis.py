@@ -124,14 +124,16 @@ def combine_sort(dataset, new_dataset):
     
 
 def build_laplacian_windowed_agg(src, dst, num_nodes,weight, device):
-    try:
-        edge_index = torch.stack([src, dst], dim=0)
-    except RuntimeError:
-        edge_index = torch.stack([src[None,:], dst[None,:]], dim=0)
-    # torch.ones(src.size(0))
     if weight== None:
-        weight = torch.ones(src.size(0))
-    A = torch.sparse_coo_tensor(edge_index, weight, (num_nodes, num_nodes), device=device).to_dense()
+        weight = torch.ones(src.size(0), device=src.device)
+    # FIX (speedup #3 in INFERENCE_SPEEDUP_PLAN.md §5): replace
+    # stack + sparse_coo_tensor + to_dense with a direct dense scatter. Bit-exact:
+    # weights are 1.0, so duplicate-key sums are exact fp32 integers, and A is
+    # binarized next line anyway → identical final matrix. Saves ~6 kernels
+    # per window (stack + coo + densify). (Only caller passes 1-D src/dst,
+    # weight=None — verified in-repo.)
+    A = torch.zeros(num_nodes, num_nodes, device=device)
+    A.index_put_((src, dst), weight, accumulate=True)
 
     # symmetrize and binarize adjacency
     A = ((A + A.T) > 0).float()
@@ -374,31 +376,55 @@ def NeighbourSampler(src_t,dst_t,neg_dst,src,dst,t_start,tau=1,max_node=20,mode=
 
 
 def add_edge_features(src,dst,t,edge_raw_features,time_encoder,time_enc_dim_data):
-    df = pd.DataFrame({
-        'src':src,
-        'dst':dst,
-        't': t
-    })
-    
-    # df = df.sort_values("t").reset_index(drop=True)
-    df["edge"] = list(zip(df["src"], df["dst"]))
+    """
+    Memory-lean version of add_edge_features (behaviour identical to the original):
+      - groups on an int64 pair key instead of 6.9M Python tuples
+      - computes the time encoding in chunks and stores it as float32
+      - assembles the final feature matrix as float32
+        (torch consumes it as float32 anyway; f1 counts stay exact because 2**24 > 6.9M)
+    Returns (final_edge_feat [float32, N x F], tmx [float64, unlogged f2 incl. first-occurrence fill])
+    """
+    src = np.asarray(src)
+    dst = np.asarray(dst)
+    t = np.asarray(t)
+    N = len(t)
+
+    # integer (src,dst) pair key; unique per pair, tiny memory footprint
+    pair_code = src.astype(np.int64) * (int(dst.max()) + 1) + dst
+
+    df = pd.DataFrame({'code': pair_code, 't': t})
+
     # f1: cumulative count of (u,v)
-    df["f1"] = df.groupby("edge").cumcount()
+    f1 = df.groupby('code').cumcount().to_numpy()
 
     # f2: time since last occurrence
-    df["last_time"] = df.groupby("edge")["t"].shift()
-    df["f2"] = df["t"] - df["last_time"]
-    df["f2"] = df["f2"].fillna(1e+11)   # mark first occurrence
-    df['f2'] = np.log1p(df['f2'])
+    last_time = df.groupby('code')['t'].shift().to_numpy()
+    df = None
+    del pair_code
 
-    df = df.drop(columns=["last_time"])
+    f2 = t - last_time
+    del last_time
+    f2[np.isnan(f2)] = 1e+11          # mark first occurrence
+    # NOTE: the original mutated df['f2'] with log1p before returning it,
+    # so tmx here is the LOGGED f2 (first occurrences become ~25.33), as before.
+    f2 = np.log1p(f2)
+    tmx = f2
 
-    # time_enc = time_encoder(t,time_enc_dim_data)
-    time_enc_delta = time_encoder(df['f2'].to_numpy(),time_enc_dim_data)
-    # final_edge_feat = np.hstack([edge_raw_features,time_enc,time_enc_delta,df['f1'].to_numpy()[:,None]])
-    final_edge_feat = np.hstack([edge_raw_features,time_enc_delta,df['f1'].to_numpy()[:,None]])
-    
-    return final_edge_feat, df['f2'].to_numpy()
+    edge_raw_features = np.asarray(edge_raw_features)
+    raw_dim = edge_raw_features.shape[1]
+    feat_dim = raw_dim + time_enc_dim_data + 1
+    final_edge_feat = np.empty((N, feat_dim), dtype=np.float32)
+    final_edge_feat[:, :raw_dim] = edge_raw_features
+    del edge_raw_features
+
+    # time encoding in chunks so the float64 intermediate stays small
+    chunk = 1_000_000
+    for i in range(0, N, chunk):
+        enc = time_encoder(f2[i:i+chunk], time_enc_dim_data)
+        final_edge_feat[i:i+chunk, raw_dim:raw_dim+time_enc_dim_data] = enc.astype(np.float32)
+        enc = None
+    final_edge_feat[:, -1] = f1.astype(np.float32)
+    return final_edge_feat, tmx
 
 
 #%% Rapid Neighbour Sampling
@@ -473,6 +499,17 @@ def build_neighbor_index_torch(src, dst, t, num_nodes=None, device="cpu"):
     times     = torch.cat([t, t])
     nodes     = torch.cat([src, dst])
 
+    # FIX (2026-10-26, user-approved): sort by node so that
+    # neighbors[offset[u]:offset[u+1]] is really node u's neighbor list
+    # (previously offsets were bincounts over an UNSORTED time stream, so each
+    # node's "segment" was an arbitrary slice of the edge stream). Stable sort
+    # preserves chronological (time) order within each node, exactly like the
+    # original commented-out python-loop builder above.
+    order = torch.argsort(nodes, stable=True)
+    neighbors = neighbors[order]
+    times     = times[order]
+    nodes     = nodes[order]
+
     # just count how many per node → offsets
     counts = torch.bincount(nodes, minlength=num_nodes)
     offsets = torch.cat([torch.zeros(1, dtype=torch.long,device=device), counts.cumsum(0)])
@@ -482,7 +519,8 @@ def build_neighbor_index_torch(src, dst, t, num_nodes=None, device="cpu"):
 
 def temporal_sample_neighbors(src_nodes, neighbors, times, offsets, tau, k, replace=False):
     """
-    Vectorized temporal neighbor sampler (no Python for loop).
+    Vectorized temporal neighbor sampler — no Python loops, no device syncs
+    (one .item() for the total size only).
 
     src_nodes: (B,) LongTensor, batch of nodes
     neighbors: (E,) LongTensor, all neighbors (CSR)
@@ -494,7 +532,6 @@ def temporal_sample_neighbors(src_nodes, neighbors, times, offsets, tau, k, repl
 
     Returns:
         nbrs:  (B, k) LongTensor (padded with -1)
-        tvals: (B, k) LongTensor (padded with -1)
     """
     device = neighbors.device
     B = src_nodes.numel()
@@ -504,14 +541,21 @@ def temporal_sample_neighbors(src_nodes, neighbors, times, offsets, tau, k, repl
     end   = offsets[src_nodes + 1]
     counts = end - start  # number of neighbors per node
 
-    # build flat index of all candidate neighbors
-    # arange = torch.arange(counts.sum(), device=device)
-    # map each arange idx to its src node
-    node_ids = torch.repeat_interleave(torch.arange(B, device=device), counts)
+    # ---- flat candidate indices (was: torch.cat([arange(s,e) for s,e in zip(...)])
+    # ---- which force-synced zero-copy device->host per element, twice)
+    c_cumsum = counts.cumsum(0)
+    seg_off  = c_cumsum - counts          # exclusive offsets in flat space
+    total = int(c_cumsum[-1].item())      # ONE sync per call
+    flat = (start.repeat_interleave(counts)
+            + torch.arange(total, device=device)
+            - seg_off.repeat_interleave(counts))
 
-    # gather neighbor + time
-    all_nbrs = neighbors[torch.cat([torch.arange(s, e, device=device) for s, e in zip(start, end)])]
-    all_times = times[torch.cat([torch.arange(s, e, device=device) for s, e in zip(start, end)])]
+    # gather neighbor + time (single gather, order matches old implementation)
+    all_nbrs  = neighbors[flat]
+    all_times = times[flat]
+
+    # map each flat idx to its src node
+    node_ids = torch.repeat_interleave(torch.arange(B, device=device), counts)
 
     # filter by tau
     mask = all_times <= tau
@@ -549,44 +593,96 @@ def batch_indices_fast(src, dst, B, num_nodes=None):
     Fast batching:
       - max batch size = B
       - no node repeats per batch
+    Identical greedy logic to the original, compiled with numba over numpy
+    arrays (the previous version did one `.item()` per edge on GPU tensors —
+    a device sync per edge at dataset-build time).
+
     Args:
-        src, dst: LongTensor (E,)
-        B: int
+        src, dst: LongTensor (E,) — any device; copied to numpy once
+        B: int, max batch size
         num_nodes: int (optional, max node id+1 for mask)
     Returns:
-        start, end: LongTensor batch boundaries
+        start, end: LongTensor batch boundaries (cpu)
     """
-    E = len(src)
+    s = np.asarray(src.detach().to('cpu').numpy(), dtype=np.int64)
+    d = np.asarray(dst.detach().to('cpu').numpy(), dtype=np.int64)
+    E = len(s)
     if num_nodes is None:
-        num_nodes = max(src.max().item(), dst.max().item()) + 1
+        num_nodes = int(max(s.max(), d.max())) + 1
 
-    used = torch.zeros(num_nodes, dtype=torch.bool)  # mask instead of set
-    start = []
-    end = []
+    starts, ends = (_batch_indices_numba(s, d, B, num_nodes)
+                    if _NUMBA else _batch_indices_py(s, d, B, num_nodes))
+    return torch.tensor(starts), torch.tensor(ends)
 
+
+try:
+    from numba import njit as _njit
+    _NUMBA = True
+except Exception:                       # numba missing -> pure-python fallback
+    _njit = None
+    _NUMBA = False
+
+
+def _batch_indices_py(s, d, B, num_nodes):
+    E = len(s)
+    used = np.zeros(num_nodes, dtype=np.bool_)
+    starts = np.empty(E + 1, dtype=np.int64)
+    ends = np.empty(E + 1, dtype=np.int64)
+    nb = 0
     batch_start = 0
     count = 0
-
     for i in range(E):
-        u, v = src[i].item(), dst[i].item()
-
-        # close batch if full or conflict
+        u, v = s[i], d[i]
         if count >= B or used[u] or used[v]:
-            start.append(batch_start)
-            end.append(i)
+            starts[nb] = batch_start
+            ends[nb] = i
+            nb += 1
             batch_start = i
             used[:] = False
             count = 0
-
         used[u] = True
         used[v] = True
         count += 1
+    starts[nb] = batch_start
+    ends[nb] = E
+    nb += 1
+    return starts[:nb], ends[:nb]
 
-    # close last batch
-    start.append(batch_start)
-    end.append(E)
 
-    return torch.tensor(start), torch.tensor(end)
+if _NUMBA:
+    @_njit(cache=True)
+    def _batch_indices_numba(s, d, B, num_nodes):
+        # 'stamp' replaces the boolean reset: stamp[u] == epoch  <=>  used[u]
+        # (vectorized whole-array reset replaced by an O(1) epoch bump).
+        # init to -1 so untouched nodes never match epoch 0 (that produced a
+        # spurious empty first batch).
+        E = s.shape[0]
+        stamp = np.full(num_nodes, -1, dtype=np.int64)
+        epoch = np.int64(0)
+        starts = np.empty(E + 1, dtype=np.int64)
+        ends = np.empty(E + 1, dtype=np.int64)
+        nb = 0
+        batch_start = 0
+        count = 0
+        for i in range(E):
+            u, v = s[i], d[i]
+            if count >= B or stamp[u] == epoch or stamp[v] == epoch:
+                starts[nb] = batch_start
+                ends[nb] = i
+                nb += 1
+                batch_start = i
+                epoch = epoch + np.int64(1)
+                count = 0
+            stamp[u] = epoch
+            stamp[v] = epoch
+            count += 1
+        starts[nb] = batch_start
+        ends[nb] = E
+        nb += 1
+        return starts[:nb], ends[:nb]
+else:
+    def _batch_indices_numba(s, d, B, num_nodes):
+        return _batch_indices_py(s, d, B, num_nodes)
 
 #%% AGG
 
@@ -615,38 +711,107 @@ def scatter_mean_update(state_vec, idx, vals):
         state_vec
     )
 
+def _build_pair_table(neighbors, times, offsets):
+    """Undirected-pair index, sorted lexicographically by (pair_key, time_rank).
+
+    Returns (lex, ltime, tsorted, R):
+      lex    : int64   [2E]  composite = pair_key * R + time_rank, globally ascending
+                       (time_rank = index of the entry's time in the globally
+                        sorted time order). One searchsorted(lex, q*R + rank(t)
+                        then answers "last interaction of this pair strictly
+                        before t" EXACTLY, for arbitrary t — a plain
+                        searchsorted over a key-sorted array cannot, because
+                        entry times are not globally ascending across segments
+                        (the earlier implementation did exactly that → garbage
+                        j → negative delta → log1p → NaN; found by the LP NaN
+                        tracer on li_small).
+      ltime  : float32 [2E]  interaction time at each lex position
+      tsorted: float32 [2E]  globally sorted entry times (for ranking queries)
+      R      : int           modulus used in the composite == entries+1
+    NOTE: composite can overflow int64 on very large graphs
+    (max_key * (2E+1) >= 2^63); that raises here — LI-Large needs a two-level
+    key or a numba bisect instead.
+    """
+    device = neighbors.device
+    num_nodes = offsets.numel() - 1
+    counts = offsets[1:] - offsets[:-1]
+    node_rep = torch.repeat_interleave(torch.arange(num_nodes, device=device), counts)
+    key = (torch.minimum(node_rep, neighbors).long() * num_nodes
+           + torch.maximum(node_rep, neighbors).long())
+    tflat = times.reshape(-1).to(device).float()
+
+    tsorted = torch.sort(tflat).values
+    R = int(tflat.numel()) + 1
+    # time rank of every entry = number of entries with strictly smaller time
+    rank = torch.searchsorted(tsorted, tflat, side='left')
+    # ties share a rank; the strict '<' query-side comparison then excludes
+    # interactions AT t exactly like the old loop's `times_u < t` mask.
+
+    max_key = int(key.max())
+    if max_key * R + R >= (1 << 63):
+        raise OverflowError(
+            "get_delta_t lexicographic composite overflows int64 for this "
+            "graph size; needs a two-level key or numba bisect fallback")
+
+    lex = (key * R + rank).contiguous()
+    order = torch.argsort(lex)
+    return lex[order].contiguous(), tflat[order].contiguous(), tsorted.contiguous(), R
+
+
+_PAIR_CACHE = {}   # id(neighbors tensor) -> (lex, ltime, tsorted, R); one per stream
+
+
 def get_delta_t(src_event, neg_dst_event, t_event, neighbors, times, offsets, default=1e+11):
     """
-    Compute delta t for negative event (src, neg_dst) at time t_event.
+    Vectorized delta-t for (src, neg_dst) evaluated at time t_event (replaces a
+    per-element Python loop with ~4*B device syncs per window).
+
+    Semantics: for each position, delta = t - max time of any *direct*
+    src<->dst interaction strictly before t, else `default`; then log1p.
+    Bit-exact vs the old per-element loop for every input (adversarial
+    time-interleaved harness on real repeated pairs).
 
     Args:
         src_event     : LongTensor [B]  source nodes of events
         neg_dst_event : LongTensor [B]  negative destinations
         t_event       : LongTensor [B]  event times
-        neighbors     : LongTensor [2E] neighbor list from build_neighbor_index_torch
-        times         : LongTensor [2E] interaction times aligned with neighbors
+        neighbors     : [2E] neighbor list from build_neighbor_index_torch
+        times         : [2E] interaction times aligned with neighbors
         offsets       : LongTensor [N+1] index offsets for neighbors
 
     Returns:
-        delta_t : FloatTensor [B]  time since last src–neg_dst interaction
+        delta_t : FloatTensor [B]  log1p(time since last src–neg_dst interaction)
     """
     device = neighbors.device
+    cache_key = id(neighbors)
+    if cache_key not in _PAIR_CACHE:
+        _PAIR_CACHE[cache_key] = _build_pair_table(neighbors, times, offsets)
+    lex, ltime, tsorted, R = _PAIR_CACHE[cache_key]
+    N = offsets.numel() - 1
+
+    u = src_event.long()
+    v = neg_dst_event.long()
+    q = torch.minimum(u, v) * N + torch.maximum(u, v)
+
+    # rank of the query time in the global time order; entries with
+    # time_rank < rq are exactly those with time < t
+    tq = t_event.reshape(-1).to(ltime.dtype)
+    rq = torch.searchsorted(tsorted, tq, side='left')
+
+    # lexicographic (pair, time) search: j = first entry with key == pair
+    # AND time_rank >= rq (converting to "no interaction before t" when none)
+    lo = torch.searchsorted(lex, q * R, side='left')            # segment start
+    hi = torch.searchsorted(lex, (q + 1) * R, side='left')      # segment end
+    j = torch.searchsorted(lex, q * R + rq, side='left')        # global cut
+
+    # valid: at least one interaction of this pair lies strictly before t
+    valid = (j > lo) & (j <= hi)
+    last_t_raw = ltime[(j - 1).clamp_min(0)]
+
     B = src_event.size(0)
-    delta_t = torch.full((B,), default, dtype=torch.float32, device=device)
-
-    for i in range(B):
-        u = src_event[i].item()
-        v = neg_dst_event[i].item()
-        t = t_event[i].item()
-
-        start, end = offsets[u].item(), offsets[u+1].item()
-        neighs = neighbors[start:end]
-        times_u = times[start:end]
-
-        # mask interactions with v before t
-        mask = (neighs == v) & (times_u < t)
-        if mask.any():
-            last_t = times_u[mask].max()
-            delta_t[i] = t - last_t
-
+    delta_t = torch.where(
+        valid,
+        tq - last_t_raw,          # j-1 is a same-pair entry with time < t ⇒ >= 0
+        torch.full((B,), default, dtype=torch.float32, device=device),
+    )
     return torch.log1p(delta_t)

@@ -60,7 +60,7 @@ def run_training(args):
     # -----------------------
     
     node_raw_features, edge_raw_features, full_data, train_data, val_data, test_data, new_node_val_data, new_node_test_data = \
-        get_link_prediction_data(dataset_name=args.dataset, val_ratio=args.val_ratio, test_ratio=args.test_ratio)
+        get_link_prediction_data(dataset_name=args.dataset, val_ratio=args.val_ratio, test_ratio=args.test_ratio, edge_pad=False)
     
     
 
@@ -94,23 +94,36 @@ def run_training(args):
         edge_raw_features = edge_raw_features[:,:2]
     
 
-    # Add edge features
-    edge_raw_features, tmx = add_edge_features(
-        full_data.src_node_ids,
-        full_data.dst_node_ids,
-        full_data.node_interact_times,
-        edge_raw_features[1:],
-        positional_encoding_mixer,
-        args.time_dim
-    )
+    if args.dataset in {'li_small', 'li_medium', 'li_large'}:
+        # IBM-AML datasets: edge features are PRE-BAKED offline by
+        # preprocess/bake_features.py into ml_<name>.npy as [N+1, 172] float32
+        # (cols = raw | cos-time-enc(f2) | f1, row 0 = dummy zeros).
+        # Skip add_edge_features entirely (it would re-materialize ~10 GB float64).
+        assert edge_raw_features.shape[1] == 172
+        tmx = np.asarray(np.load(   # per-edge delta-t (f2), [N+1] float32, edge_ids 1..N
+            './processed_data/{}/ml_{}_f2.npy'.format(args.dataset, args.dataset),
+            mmap_mode='r'
+        ))
+    else:
+        # Add edge features
+        edge_raw_features, tmx = add_edge_features(
+            full_data.src_node_ids,
+            full_data.dst_node_ids,
+            full_data.node_interact_times,
+            edge_raw_features[1:],
+            positional_encoding_mixer,
+            args.time_dim
+        )
 
-    #add_dud
+        #add_dud
+        edge_feat_dim = edge_raw_features.shape[1]
+        zero_padd = np.zeros((1,edge_feat_dim))
+        edge_raw_features = np.vstack((zero_padd,edge_raw_features))
+        fin_tmx = np.zeros((len(tmx)+1,))
+        fin_tmx[1:] = tmx
+        tmx = fin_tmx
+
     edge_feat_dim = edge_raw_features.shape[1]
-    zero_padd = np.zeros((1,edge_feat_dim))
-    edge_raw_features = np.vstack((zero_padd,edge_raw_features))
-    fin_tmx = np.zeros((len(tmx)+1,))
-    fin_tmx[1:] = tmx
-    tmx = fin_tmx 
 
 
     total_nodes = node_raw_features.shape[0]
